@@ -1,93 +1,112 @@
-import torch 
-import torch.optim as optim
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import transforms
-from tqdm import tqdm
-from my_utils import *
-from model import UNET
 import os
-
-if torch.cuda.is_available():
-    DEVICE = 'cuda:0'
-    print('Running on the GPU')
-else:
-    DEVICE = "cpu"
-    print('Running on the CPU')
-
-MODEL_PATH= "../modelUNET/unet.pt"
-
-LOAD_MODEL = False
-ROOT_DIR = '../datasets/cityscapes'
-IMG_HEIGHT = 110
-IMG_WIDTH = 220
-BATCH_SIZE = 16
-LEARNING_RATE = 0.0001
-EPOCHS = 10
-
-def train_function(data, model, optimizer, loss_fn, device):
-    print('Entering into train function')
-    loss_values = []
-    data = tqdm(data)
-    for index, batch in enumerate(data):
-        X, y = batch
-        X, y = X.to(device), y.to(device)
-        preds = model(X)
-
-        loss = loss_fn(preds, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    return loss.item()
+import cv2
+import torch
+import numpy as np
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms, models
+from tqdm import tqdm
+from dataset import CityscapesDataset
 
 
 def main():
-    global epoch
-    epoch = 0 # epoch is initially assigned to 0. If LOAD_MODEL is true then
-              # epoch is set to the last value + 1.
-    LOSS_VALS = [] # Defining a list to store loss values after every epoch
+    DATASET_DIR = "datasets/cityscapes"
 
-    transform = transforms.Compose([
-        transforms.Resize((IMG_HEIGHT, IMG_WIDTH), interpolation=Image.NEAREST),
+    train_img_root = os.path.join(DATASET_DIR, "leftImg8bit/train")
+    train_mask_root = os.path.join(DATASET_DIR, "gtFine/train")
+
+    image_transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((256, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    train_set = get_cityscapes_data(
-        split='train',
-        mode='fine',
-        root_dir=ROOT_DIR,
-        transforms=transform,
-        batch_size=BATCH_SIZE,
+    mask_transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((256, 512), interpolation=0)
+    ])
+
+    train_dataset = CityscapesDataset(train_img_root, train_mask_root,
+                                      image_transform, mask_transform)
+
+    print("Total training images:", len(train_dataset))
+
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+
+    train_dataset, val_dataset = random_split(train_dataset,
+                                              [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset,
+                              batch_size=4,
+                              shuffle=True,
+                              num_workers=0,
+                              pin_memory=True)
+
+    val_loader = DataLoader(val_dataset,
+                            batch_size=4,
+                            shuffle=False,
+                            num_workers=0,
+                            pin_memory=True)
+
+    print("Train:", len(train_dataset))
+    print("Val:", len(val_dataset))
+
+    # DataLoaders
+    train_loader = DataLoader(train_dataset,
+                              batch_size=4,
+                              shuffle=True,
+                              num_workers=0,
+                              pin_memory=True)
+    val_loader = DataLoader(val_dataset,
+                            batch_size=4,
+                            shuffle=False,
+                            num_workers=0,
+                            pin_memory=True)
+
+    print(
+        f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}"
     )
 
-    print('Data Loaded Successfully!')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Defining the model, optimizer and loss function
-    unet = UNET(in_channels=3, classes=19).to(DEVICE).train()
-    optimizer = optim.Adam(unet.parameters(), lr=LEARNING_RATE)
-    loss_function = nn.CrossEntropyLoss(ignore_index=255)
+    model = models.segmentation.deeplabv3_resnet50(pretrained=True)
+    model.classifier[4] = nn.Conv2d(256, 19, kernel_size=1)
 
-    # Loading a previous stored model from MODEL_PATH variable
-    if LOAD_MODEL == True:
-        checkpoint = torch.load(MODEL_PATH)
-        unet.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optim_state_dict'])
-        epoch = checkpoint['epoch']+1
-        LOSS_VALS = checkpoint['loss_values']
-        print("Model successfully loaded!")
+    model.to(device)
 
-    #Training the model for every epoch.
-    for e in range(epoch, EPOCHS):
-        print(f'Epoch: {e}')
-        loss_val = train_function(train_set, unet, optimizer, loss_function, DEVICE)
-        LOSS_VALS.append(loss_val) 
-        torch.save({
-            'model_state_dict': unet.state_dict(),
-            'optim_state_dict': optimizer.state_dict(),
-            'epoch': e,
-            'loss_values': LOSS_VALS
-        }, MODEL_PATH)
-        print("Epoch completed and model successfully saved!")
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler('cuda')  # mixed precision
+    num_epochs = 2
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+
+        for batch in loop:
+            inputs = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+
+            optimizer.zero_grad()
+
+            outputs = model(inputs)['out']
+            loss = criterion(outputs, masks)
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
+
+        epoch_loss = running_loss / len(train_loader)
+        print(f"Train Loss: {epoch_loss:.4f}")
+
+    torch.save(model.state_dict(), "deeplabv3_tenep.pt")
+    print("Model saved.")
 
 
 if __name__ == '__main__':
